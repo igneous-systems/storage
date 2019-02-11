@@ -1360,7 +1360,7 @@ func (s *store) ImageBigData(id, key string) ([]byte, error) {
 	}
 	for _, s := range append([]ROImageStore{istore}, istores...) {
 		store := s
-		store.Lock()
+		store.RLock()
 		defer store.Unlock()
 		if modified, err := store.Modified(); modified || err != nil {
 			store.Load()
@@ -2340,8 +2340,7 @@ func (s *store) Diff(from, to string, options *DiffOptions) (io.ReadCloser, erro
 	}
 	for _, s := range append([]ROLayerStore{lstore}, lstores...) {
 		store := s
-		store.Lock()
-		defer store.Unlock()
+		store.RLock()
 		if modified, err := store.Modified(); modified || err != nil {
 			store.Load()
 		}
