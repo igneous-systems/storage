@@ -1141,6 +1141,10 @@ func (r *layerStore) Lock() {
 	r.lockfile.Lock()
 }
 
+func (r *layerStore) RecursiveLock() {
+	r.lockfile.RecursiveLock()
+}
+
 func (r *layerStore) RLock() {
 	r.lockfile.RLock()
 }
