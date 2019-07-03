@@ -1,0 +1,21 @@
+description: Build Local (No VM Builds)
+
+slavetypes:
+    - c3.xlarge
+
+steps:
+    - Checkout
+
+    - ShellCommand:
+        name: "link-local-gopath"
+        command: >
+            mkdir -p go/src/github.com/containers/ && ln -s . go/src/github.com/containers/storage
+        maxTime: 60
+        haltOnFailure: true
+
+    - ShellCommand:
+        name: "build-local-binary"
+        command: >
+            PATH=$PATH:/usr/src/go1.10.3/go/bin:$(pwd)/go/bin GOPATH=$(pwd)/go annotate-output
+            make install.tools local-binary docs local-validate local-cross
+        maxTime: 2400
