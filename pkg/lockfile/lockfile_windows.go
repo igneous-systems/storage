@@ -1,6 +1,6 @@
 // +build windows
 
-package storage
+package lockfile
 
 import (
 	"os"
@@ -19,6 +19,12 @@ type lockfile struct {
 
 func (l *lockfile) Lock() {
 }
+
+func (l *lockfile) RLock() {
+	l.mu.Lock()
+	l.locked = true
+}
+
 func (l *lockfile) Unlock() {
 }
 func (l *lockfile) Modified() (bool, error) {

@@ -1,0 +1,19 @@
+description: Build Local (No VM Builds)
+
+slavetypes:
+    - c3.xlarge
+
+steps:
+    - Checkout
+
+    - ShellCommand:
+        name: "build-local-binary"
+        command: >
+            ./iggy-make.sh install.tools local-binary docs local-cross
+        maxTime: 2400
+
+    - ShellCommand:
+        name: "build-local-binary"
+        command: >
+            ./iggy-make.sh clean
+        maxTime: 60
