@@ -15,6 +15,10 @@ type Locker interface {
 	// Acquire a writer lock.
 	Lock()
 
+	// Acquire a writer lock recursively, allowing for recursive acquisitions
+	// within the same process space.
+	RecursiveLock()
+
 	// Unlock the lock.
 	Unlock()
 
@@ -34,6 +38,9 @@ type Locker interface {
 
 	// IsReadWrite() checks if the lock file is read-write
 	IsReadWrite() bool
+
+	// Locked() checks if lock is locked for writing by a thread in this process
+	Locked() bool
 }
 
 var (
@@ -55,15 +62,27 @@ func GetROLockfile(path string) (Locker, error) {
 	return getLockfile(path, true)
 }
 
-// getLockfile is a helper for GetLockfile and GetROLockfile and returns Locker
-// based on the path and read-only property.
+// getLockfile returns a Locker object, possibly (depending on the platform)
+// working inter-process, and associated with the specified path.
+//
+// If ro, the lock is a read-write lock and the returned Locker should correspond to the
+// “lock for reading” (shared) operation; otherwise, the lock is either an exclusive lock,
+// or a read-write lock and Locker should correspond to the “lock for writing” (exclusive) operation.
+//
+// WARNING:
+// - The lock may or MAY NOT be inter-process.
+// - There may or MAY NOT be an actual object on the filesystem created for the specified path.
+// - Even if ro, the lock MAY be exclusive.
 func getLockfile(path string, ro bool) (Locker, error) {
 	lockfilesLock.Lock()
 	defer lockfilesLock.Unlock()
 	if lockfiles == nil {
 		lockfiles = make(map[string]Locker)
 	}
-	cleanPath := filepath.Clean(path)
+	cleanPath, err := filepath.Abs(path)
+	if err != nil {
+		return nil, errors.Wrapf(err, "error ensuring that path %q is an absolute path", path)
+	}
 	if locker, ok := lockfiles[cleanPath]; ok {
 		if ro && locker.IsReadWrite() {
 			return nil, errors.Errorf("lock %q is not a read-only lock", cleanPath)
@@ -73,10 +92,10 @@ func getLockfile(path string, ro bool) (Locker, error) {
 		}
 		return locker, nil
 	}
-	locker, err := getLockFile(path, ro) // platform dependent locker
+	locker, err := createLockerForPath(cleanPath, ro) // platform-dependent locker
 	if err != nil {
 		return nil, err
 	}
-	lockfiles[filepath.Clean(path)] = locker
+	lockfiles[cleanPath] = locker
 	return locker, nil
 }

@@ -14,39 +14,11 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func getLockFile(path string, ro bool) (Locker, error) {
-	var fd int
-	var err error
-	if ro {
-		fd, err = unix.Open(path, os.O_RDONLY, 0)
-	} else {
-		fd, err = unix.Open(path, os.O_RDWR|os.O_CREATE, unix.S_IRUSR|unix.S_IWUSR)
-	}
-	if err != nil {
-		return nil, errors.Wrapf(err, "error opening %q", path)
-	}
-	unix.CloseOnExec(fd)
-
-	locktype := unix.F_WRLCK
-	if ro {
-		locktype = unix.F_RDLCK
-	}
-	return &lockfile{
-		stateMutex: &sync.Mutex{},
-		writeMutex: &sync.Mutex{},
-		file:       path,
-		fd:         uintptr(fd),
-		lw:         stringid.GenerateRandomID(),
-		locktype:   int16(locktype),
-		locked:     false,
-		ro:         ro}, nil
-}
-
 type lockfile struct {
-	// stateMutex is used to synchronize concurrent accesses
+	// rwMutex serializes concurrent reader-writer acquisitions in the same process space
+	rwMutex *sync.RWMutex
+	// stateMutex is used to synchronize concurrent accesses to the state below
 	stateMutex *sync.Mutex
-	// writeMutex is used to serialize and avoid recursive writer locks
-	writeMutex *sync.Mutex
 	counter    int64
 	file       string
 	fd         uintptr
@@ -54,64 +26,129 @@ type lockfile struct {
 	locktype   int16
 	locked     bool
 	ro         bool
+	recursive  bool
+}
+
+// openLock opens the file at path and returns the corresponding file
+// descriptor.  Note that the path is opened read-only when ro is set.  If ro
+// is unset, openLock will open the path read-write and create the file if
+// necessary.
+func openLock(path string, ro bool) (int, error) {
+	if ro {
+		return unix.Open(path, os.O_RDONLY, 0)
+	}
+	return unix.Open(path, os.O_RDWR|os.O_CREATE, unix.S_IRUSR|unix.S_IWUSR)
+}
+
+// createLockerForPath returns a Locker object, possibly (depending on the platform)
+// working inter-process and associated with the specified path.
+//
+// This function will be called at most once for each path value within a single process.
+//
+// If ro, the lock is a read-write lock and the returned Locker should correspond to the
+// “lock for reading” (shared) operation; otherwise, the lock is either an exclusive lock,
+// or a read-write lock and Locker should correspond to the “lock for writing” (exclusive) operation.
+//
+// WARNING:
+// - The lock may or MAY NOT be inter-process.
+// - There may or MAY NOT be an actual object on the filesystem created for the specified path.
+// - Even if ro, the lock MAY be exclusive.
+func createLockerForPath(path string, ro bool) (Locker, error) {
+	// Check if we can open the lock.
+	fd, err := openLock(path, ro)
+	if err != nil {
+		return nil, errors.Wrapf(err, "error opening %q", path)
+	}
+	unix.Close(fd)
+
+	locktype := unix.F_WRLCK
+	if ro {
+		locktype = unix.F_RDLCK
+	}
+	return &lockfile{
+		stateMutex: &sync.Mutex{},
+		rwMutex:    &sync.RWMutex{},
+		file:       path,
+		lw:         stringid.GenerateRandomID(),
+		locktype:   int16(locktype),
+		locked:     false,
+		ro:         ro}, nil
 }
 
 // lock locks the lockfile via FCTNL(2) based on the specified type and
 // command.
-func (l *lockfile) lock(l_type int16) {
+func (l *lockfile) lock(l_type int16, recursive bool) {
 	lk := unix.Flock_t{
 		Type:   l_type,
 		Whence: int16(os.SEEK_SET),
 		Start:  0,
 		Len:    0,
-		Pid:    int32(os.Getpid()),
 	}
-	if l_type == unix.F_WRLCK {
-		// If we try to lock as a writer, lock the writerMutex first to
-		// avoid multiple writer acquisitions of the same process.
-		// Note: it's important to lock it prior to the stateMutex to
-		// avoid a deadlock.
-		l.writeMutex.Lock()
+	switch l_type {
+	case unix.F_RDLCK:
+		l.rwMutex.RLock()
+	case unix.F_WRLCK:
+		if recursive {
+			// NOTE: that's okay as recursive is only set in RecursiveLock(), so
+			// there's no need to protect against hypothetical RDLCK cases.
+			l.rwMutex.RLock()
+		} else {
+			l.rwMutex.Lock()
+		}
+	default:
+		panic(fmt.Sprintf("attempted to acquire a file lock of unrecognized type %d", l_type))
 	}
 	l.stateMutex.Lock()
-	l.locktype = l_type
+	defer l.stateMutex.Unlock()
 	if l.counter == 0 {
+		// If we're the first reference on the lock, we need to open the file again.
+		fd, err := openLock(l.file, l.ro)
+		if err != nil {
+			panic(fmt.Sprintf("error opening %q", l.file))
+		}
+		unix.CloseOnExec(fd)
+		l.fd = uintptr(fd)
+
 		// Optimization: only use the (expensive) fcntl syscall when
-		// the counter is 0.  If it's greater than that, we're owning
-		// the lock already and can only be a reader.
+		// the counter is 0.  In this case, we're either the first
+		// reader lock or a writer lock.
 		for unix.FcntlFlock(l.fd, unix.F_SETLKW, &lk) != nil {
 			time.Sleep(10 * time.Millisecond)
 		}
 	}
+	l.locktype = l_type
 	l.locked = true
+	l.recursive = recursive
 	l.counter++
-	l.stateMutex.Unlock()
 }
 
-// Lock locks the lockfile as a writer.  Note that RLock() will be called if
-// the lock is a read-only one.
+// Lock locks the lockfile as a writer.  Panic if the lock is a read-only one.
 func (l *lockfile) Lock() {
+	if l.ro {
+		panic("can't take write lock on read-only lock file")
+	} else {
+		l.lock(unix.F_WRLCK, false)
+	}
+}
+
+// RecursiveLock locks the lockfile as a writer but allows for recursive
+// acquisitions within the same process space.  Note that RLock() will be called
+// if it's a lockTypReader lock.
+func (l *lockfile) RecursiveLock() {
 	if l.ro {
 		l.RLock()
 	} else {
-		l.lock(unix.F_WRLCK)
+		l.lock(unix.F_WRLCK, true)
 	}
 }
 
 // LockRead locks the lockfile as a reader.
 func (l *lockfile) RLock() {
-	l.lock(unix.F_RDLCK)
+	l.lock(unix.F_RDLCK, false)
 }
 
 // Unlock unlocks the lockfile.
 func (l *lockfile) Unlock() {
-	lk := unix.Flock_t{
-		Type:   unix.F_UNLCK,
-		Whence: int16(os.SEEK_SET),
-		Start:  0,
-		Len:    0,
-		Pid:    int32(os.Getpid()),
-	}
 	l.stateMutex.Lock()
 	if l.locked == false {
 		// Panic when unlocking an unlocked lock.  That's a violation
@@ -130,23 +167,32 @@ func (l *lockfile) Unlock() {
 		// avoid releasing read-locks too early; a given process may
 		// acquire a read lock multiple times.
 		l.locked = false
-		for unix.FcntlFlock(l.fd, unix.F_SETLKW, &lk) != nil {
-			time.Sleep(10 * time.Millisecond)
-		}
+		// Close the file descriptor on the last unlock, releasing the
+		// file lock.
+		unix.Close(int(l.fd))
 	}
-	if l.locktype == unix.F_WRLCK {
-		l.writeMutex.Unlock()
+	if l.locktype == unix.F_RDLCK || l.recursive {
+		l.rwMutex.RUnlock()
+	} else {
+		l.rwMutex.Unlock()
 	}
 	l.stateMutex.Unlock()
 }
 
-// Locked checks if lockfile is locked.
+// Locked checks if lockfile is locked for writing by a thread in this process.
 func (l *lockfile) Locked() bool {
-	return l.locked
+	l.stateMutex.Lock()
+	defer l.stateMutex.Unlock()
+	return l.locked && (l.locktype == unix.F_WRLCK)
 }
 
 // Touch updates the lock file with the UID of the user.
 func (l *lockfile) Touch() error {
+	l.stateMutex.Lock()
+	if !l.locked || (l.locktype != unix.F_WRLCK) {
+		panic("attempted to update last-writer in lockfile without the write lock")
+	}
+	l.stateMutex.Unlock()
 	l.lw = stringid.GenerateRandomID()
 	id := []byte(l.lw)
 	_, err := unix.Seek(int(l.fd), 0, os.SEEK_SET)
@@ -171,6 +217,11 @@ func (l *lockfile) Touch() error {
 // was loaded.
 func (l *lockfile) Modified() (bool, error) {
 	id := []byte(l.lw)
+	l.stateMutex.Lock()
+	if !l.locked {
+		panic("attempted to check last-writer in lockfile without locking it first")
+	}
+	l.stateMutex.Unlock()
 	_, err := unix.Seek(int(l.fd), 0, os.SEEK_SET)
 	if err != nil {
 		return true, err
@@ -180,7 +231,7 @@ func (l *lockfile) Modified() (bool, error) {
 		return true, err
 	}
 	if n != len(id) {
-		return true, unix.ENOSPC
+		return true, nil
 	}
 	lw := l.lw
 	l.lw = string(id)
