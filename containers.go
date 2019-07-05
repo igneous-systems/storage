@@ -191,6 +191,9 @@ func (r *containerStore) Load() error {
 }
 
 func (r *containerStore) Save() error {
+	if !r.Locked() {
+		return errors.New("container store is not locked")
+	}
 	rpath := r.containerspath()
 	if err := os.MkdirAll(filepath.Dir(rpath), 0700); err != nil {
 		return err
@@ -539,6 +542,10 @@ func (r *containerStore) Lock() {
 	r.lockfile.Lock()
 }
 
+func (r *containerStore) RecursiveLock() {
+	r.lockfile.RecursiveLock()
+}
+
 func (r *containerStore) RLock() {
 	r.lockfile.RLock()
 }
@@ -560,4 +567,8 @@ func (r *containerStore) IsReadWrite() bool {
 
 func (r *containerStore) TouchedSince(when time.Time) bool {
 	return r.lockfile.TouchedSince(when)
+}
+
+func (r *containerStore) Locked() bool {
+	return r.lockfile.Locked()
 }
